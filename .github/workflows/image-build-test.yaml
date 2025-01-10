@@ -2,7 +2,7 @@ name: image-build-test
 on: [push, pull_request]
 
 env:
-  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le
+  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
 
 jobs:
   build-image:
@@ -23,13 +23,9 @@ jobs:
         run: ./hack/get_version.sh > .version
 
       - name: Build and push container image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          # no need to explicitly set goarch, 
-          # correct arch will be selected for each build platform 
-          build-args: |
-            goarch=
           platforms: ${{ env.BUILD_PLATFORMS }}
           file: ./cmd/Dockerfile
