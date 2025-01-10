@@ -50,8 +50,9 @@ import (
 // EnvArgs args containing common, desired mac and ovs port name
 type EnvArgs struct {
 	cnitypes.CommonArgs
-	MAC     cnitypes.UnmarshallableString `json:"mac,omitempty"`
-	OvnPort cnitypes.UnmarshallableString `json:"ovnPort,omitempty"`
+	MAC         cnitypes.UnmarshallableString `json:"mac,omitempty"`
+	OvnPort     cnitypes.UnmarshallableString `json:"ovnPort,omitempty"`
+	K8S_POD_UID cnitypes.UnmarshallableString
 }
 
 func init() {
@@ -116,6 +117,10 @@ func setupVeth(contNetns ns.NetNS, contIfaceName string, requestedMac string, mt
 			return err
 		}
 
+		if err := setInterfaceUp(contIfaceName); err != nil {
+			return err
+		}
+
 		contIface.Name = containerVeth.Name
 		contIface.Mac = containerVeth.HardwareAddr.String()
 		contIface.Sandbox = contNetns.Path()
@@ -132,6 +137,19 @@ func setupVeth(contNetns ns.NetNS, contIfaceName string, requestedMac string, mt
 	}
 
 	return hostIface, contIface, nil
+}
+
+func setInterfaceUp(name string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func assignMacToLink(link netlink.Link, mac net.HardwareAddr, name string) error {
@@ -168,8 +186,8 @@ func getBridgeName(driver *ovsdb.OvsDriver, bridgeName, ovnPort, deviceID string
 	return "", fmt.Errorf("failed to get bridge name")
 }
 
-func attachIfaceToBridge(ovsDriver *ovsdb.OvsBridgeDriver, hostIfaceName string, contIfaceName string, ofportRequest uint, vlanTag uint, trunks []uint, portType string, intfType string, contNetnsPath string, ovnPortName string) error {
-	err := ovsDriver.CreatePort(hostIfaceName, contNetnsPath, contIfaceName, ovnPortName, ofportRequest, vlanTag, trunks, portType, intfType)
+func attachIfaceToBridge(ovsDriver *ovsdb.OvsBridgeDriver, hostIfaceName string, contIfaceName string, ofportRequest uint, vlanTag uint, trunks []uint, portType string, intfType string, contNetnsPath string, ovnPortName string, contPodUid string) error {
+	err := ovsDriver.CreatePort(hostIfaceName, contNetnsPath, contIfaceName, ovnPortName, ofportRequest, vlanTag, trunks, portType, intfType, contPodUid)
 	if err != nil {
 		return err
 	}
@@ -247,9 +265,11 @@ func CmdAdd(args *skel.CmdArgs) error {
 
 	var mac string
 	var ovnPort string
+	var contPodUid string
 	if envArgs != nil {
 		mac = string(envArgs.MAC)
 		ovnPort = string(envArgs.OvnPort)
+		contPodUid = string(envArgs.K8S_POD_UID)
 	}
 
 	netconf, err := config.LoadConf(args.StdinData)
@@ -291,6 +311,15 @@ func CmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
+	// check if the device driver is the type of userspace driver
+	userspaceMode := false
+	if sriov.IsOvsHardwareOffloadEnabled(netconf.DeviceID) {
+		userspaceMode, err = sriov.HasUserspaceDriver(netconf.DeviceID)
+		if err != nil {
+			return err
+		}
+	}
+
 	// removes all ports whose interfaces have an error
 	if err := cleanPorts(ovsBridgeDriver); err != nil {
 		return err
@@ -302,8 +331,9 @@ func CmdAdd(args *skel.CmdArgs) error {
 	}
 	defer contNetns.Close()
 
+	// userspace driver does not create a network interface for the VF on the host
 	var origIfName string
-	if sriov.IsOvsHardwareOffloadEnabled(netconf.DeviceID) {
+	if sriov.IsOvsHardwareOffloadEnabled(netconf.DeviceID) && !userspaceMode {
 		origIfName, err = sriov.GetVFLinkName(netconf.DeviceID)
 		if err != nil {
 			return err
@@ -312,13 +342,13 @@ func CmdAdd(args *skel.CmdArgs) error {
 
 	// Cache NetConf for CmdDel
 	if err = utils.SaveCache(config.GetCRef(args.ContainerID, args.IfName),
-		&types.CachedNetConf{Netconf: netconf, OrigIfName: origIfName}); err != nil {
+		&types.CachedNetConf{Netconf: netconf, OrigIfName: origIfName, UserspaceMode: userspaceMode}); err != nil {
 		return fmt.Errorf("error saving NetConf %q", err)
 	}
 
 	var hostIface, contIface *current.Interface
 	if sriov.IsOvsHardwareOffloadEnabled(netconf.DeviceID) {
-		hostIface, contIface, err = sriov.SetupSriovInterface(contNetns, args.ContainerID, args.IfName, netconf.MTU, netconf.DeviceID)
+		hostIface, contIface, err = sriov.SetupSriovInterface(contNetns, args.ContainerID, args.IfName, mac, netconf.MTU, netconf.DeviceID, userspaceMode)
 		if err != nil {
 			return err
 		}
@@ -329,7 +359,7 @@ func CmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	if err = attachIfaceToBridge(ovsBridgeDriver, hostIface.Name, contIface.Name, netconf.OfportRequest, vlanTagNum, trunks, portType, netconf.InterfaceType, args.Netns, ovnPort); err != nil {
+	if err = attachIfaceToBridge(ovsBridgeDriver, hostIface.Name, contIface.Name, netconf.OfportRequest, vlanTagNum, trunks, portType, netconf.InterfaceType, args.Netns, ovnPort, contPodUid); err != nil {
 		return err
 	}
 	defer func() {
@@ -353,7 +383,9 @@ func CmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// run the IPAM plugin
-	if netconf.IPAM.Type != "" {
+	// userspace driver does not support IPAM plugin,
+	// because there is no network interface for the VF on the host
+	if netconf.IPAM.Type != "" && !userspaceMode {
 		var r cnitypes.Result
 		r, err = ipam.ExecAdd(netconf.IPAM.Type, args.StdinData)
 		defer func() {
@@ -562,8 +594,11 @@ func CmdDel(args *skel.CmdArgs) error {
 				// port is already deleted in a previous invocation.
 				log.Printf("Error: %v\n", err)
 			}
-			if err = sriov.ResetVF(args, cache.Netconf.DeviceID, cache.OrigIfName); err != nil {
-				return err
+			// there is no network interface in case of userspace driver, so OrigIfName is empty
+			if !cache.UserspaceMode {
+				if err = sriov.ResetVF(args, cache.Netconf.DeviceID, cache.OrigIfName); err != nil {
+					return err
+				}
 			}
 		} else {
 			// In accordance with the spec we clean up as many resources as possible.
@@ -591,11 +626,14 @@ func CmdDel(args *skel.CmdArgs) error {
 	}
 
 	if sriov.IsOvsHardwareOffloadEnabled(cache.Netconf.DeviceID) {
-		err = sriov.ReleaseVF(args, cache.OrigIfName)
-		if err != nil {
-			// try to reset vf into original state as much as possible in case of error
-			if err := sriov.ResetVF(args, cache.Netconf.DeviceID, cache.OrigIfName); err != nil {
-				log.Printf("Failed best-effort cleanup of VF %s: %v", cache.OrigIfName, err)
+		// there is no network interface in case of userspace driver, so OrigIfName is empty
+		if !cache.UserspaceMode {
+			err = sriov.ReleaseVF(args, cache.OrigIfName)
+			if err != nil {
+				// try to reset vf into original state as much as possible in case of error
+				if err := sriov.ResetVF(args, cache.Netconf.DeviceID, cache.OrigIfName); err != nil {
+					log.Printf("Failed best-effort cleanup of VF %s: %v", cache.OrigIfName, err)
+				}
 			}
 		}
 	} else {
@@ -633,14 +671,6 @@ func CmdCheck(args *skel.CmdArgs) error {
 	}
 	ovsHWOffloadEnable := sriov.IsOvsHardwareOffloadEnabled(netconf.DeviceID)
 
-	// run the IPAM plugin
-	if netconf.NetConf.IPAM.Type != "" {
-		err = ipam.ExecCheck(netconf.NetConf.IPAM.Type, args.StdinData)
-		if err != nil {
-			return fmt.Errorf("failed to check with IPAM plugin type %q: %v", netconf.NetConf.IPAM.Type, err)
-		}
-	}
-
 	envArgs, err := getEnvArgs(args.Args)
 	if err != nil {
 		return err
@@ -670,6 +700,21 @@ func CmdCheck(args *skel.CmdArgs) error {
 
 	if err := validateCache(cache, netconf); err != nil {
 		return err
+	}
+
+	// TODO: CmdCheck for userspace driver
+	if cache.UserspaceMode {
+		return nil
+	}
+
+	// run the IPAM plugin
+	// userspace driver does not support IPAM plugin,
+	// because there is no network interface for the VF on the host
+	if netconf.NetConf.IPAM.Type != "" && !cache.UserspaceMode {
+		err = ipam.ExecCheck(netconf.NetConf.IPAM.Type, args.StdinData)
+		if err != nil {
+			return fmt.Errorf("failed to check with IPAM plugin type %q: %v", netconf.NetConf.IPAM.Type, err)
+		}
 	}
 
 	// Parse previous result.
