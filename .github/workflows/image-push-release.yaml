@@ -2,7 +2,7 @@ name: "Push images on release"
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}-plugin
-  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le
+  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
 
 on:
   push:
@@ -43,14 +43,10 @@ jobs:
         run: ./hack/get_version.sh > .version
 
       - name: Build and push container image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          # no need to explicitly set goarch, 
-          # correct arch will be selected for each build platform 
-          build-args: |
-            goarch=
           platforms: ${{ env.BUILD_PLATFORMS }}
           tags: |
             ${{ steps.docker_meta.outputs.tags }}

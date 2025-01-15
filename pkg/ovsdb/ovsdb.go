@@ -69,7 +69,7 @@ const (
 
 // connectToOvsDb connect to ovsdb
 func connectToOvsDb(ovsSocket string) (client.Client, error) {
-	dbmodel, err := model.NewDBModel("Open_vSwitch",
+	dbmodel, err := model.NewClientDBModel("Open_vSwitch",
 		map[string]model.Model{bridgeTable: &Bridge{}, ovsTable: &OpenvSwitch{}})
 	if err != nil {
 		return nil, fmt.Errorf("unable to create DB model error: %v", err)
@@ -138,7 +138,7 @@ func NewOvsBridgeDriver(bridgeName, socketFile string) (*OvsBridgeDriver, error)
 // Wrapper for ovsDB transaction
 func (ovsd *OvsDriver) ovsdbTransact(ops []ovsdb.Operation) ([]ovsdb.OperationResult, error) {
 	// Perform OVSDB transaction
-	reply, _ := ovsd.ovsClient.Transact(ops...)
+	reply, _ := ovsd.ovsClient.Transact(context.Background(), ops...)
 
 	if len(reply) < len(ops) {
 		return nil, errors.New("OVS transaction failed. Less replies than operations")
@@ -158,13 +158,13 @@ func (ovsd *OvsDriver) ovsdbTransact(ops []ovsdb.Operation) ([]ovsdb.OperationRe
 // **************** OVS driver API ********************
 
 // CreatePort Create an internal port in OVS
-func (ovsd *OvsBridgeDriver) CreatePort(intfName, contNetnsPath, contIfaceName, ovnPortName string, ofportRequest uint, vlanTag uint, trunks []uint, portType string, intfType string) error {
+func (ovsd *OvsBridgeDriver) CreatePort(intfName, contNetnsPath, contIfaceName, ovnPortName string, ofportRequest uint, vlanTag uint, trunks []uint, portType string, intfType string, contPodUid string) error {
 	intfUUID, intfOp, err := createInterfaceOperation(intfName, ofportRequest, ovnPortName, intfType)
 	if err != nil {
 		return err
 	}
 
-	portUUID, portOp, err := createPortOperation(intfName, contNetnsPath, contIfaceName, vlanTag, trunks, portType, intfUUID)
+	portUUID, portOp, err := createPortOperation(intfName, contNetnsPath, contIfaceName, vlanTag, trunks, portType, intfUUID, contPodUid)
 	if err != nil {
 		return err
 	}
@@ -658,7 +658,7 @@ func (ovsd *OvsDriver) GetOvsPortForContIface(contIface, contNetnsPath string) (
 		return "", false, err
 	}
 
-	condition := ovsdb.NewCondition("external_ids", ovsdb.ConditionEqual, ovsmap)
+	condition := ovsdb.NewCondition("external_ids", ovsdb.ConditionIncludes, ovsmap)
 	colums := []string{"name", "external_ids"}
 	port, err := ovsd.findByCondition("Port", condition, colums)
 	if err != nil {
@@ -704,7 +704,7 @@ func (ovsd *OvsDriver) FindInterfacesWithError() ([]string, error) {
 	}
 	operationResult := transactionResult[0]
 	if operationResult.Error != "" {
-		return nil, fmt.Errorf(operationResult.Error)
+		return nil, errors.New(operationResult.Error)
 	}
 
 	var names []string
@@ -853,7 +853,7 @@ func createInterfaceOperation(intfName string, ofportRequest uint, ovnPortName s
 	return intfUUID, &intfOp, nil
 }
 
-func createPortOperation(intfName, contNetnsPath, contIfaceName string, vlanTag uint, trunks []uint, portType string, intfUUID ovsdb.UUID) (ovsdb.UUID, *ovsdb.Operation, error) {
+func createPortOperation(intfName, contNetnsPath, contIfaceName string, vlanTag uint, trunks []uint, portType string, intfUUID ovsdb.UUID, contPodUid string) (ovsdb.UUID, *ovsdb.Operation, error) {
 	portUUIDStr := intfName
 	portUUID := ovsdb.UUID{GoUUID: portUUIDStr}
 
@@ -877,9 +877,10 @@ func createPortOperation(intfName, contNetnsPath, contIfaceName string, vlanTag 
 	}
 
 	oMap, err := ovsdb.NewOvsMap(map[string]string{
-		"contNetns": contNetnsPath,
-		"contIface": contIfaceName,
-		"owner":     ovsPortOwner,
+		"contPodUid": contPodUid,
+		"contNetns":  contNetnsPath,
+		"contIface":  contIfaceName,
+		"owner":      ovsPortOwner,
 	})
 	if err != nil {
 		return ovsdb.UUID{}, nil, err
@@ -1110,7 +1111,7 @@ func (ovsd *OvsDriver) findEmptyMirrors() ([]string, error) {
 	}
 	operationResult := transactionResult[0]
 	if operationResult.Error != "" {
-		return nil, fmt.Errorf(operationResult.Error)
+		return nil, errors.New(operationResult.Error)
 	}
 
 	// extract mirror names with both output_port, select_src_port and select_dst_port empty
