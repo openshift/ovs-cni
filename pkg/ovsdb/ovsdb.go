@@ -28,6 +28,7 @@ import (
 )
 
 const ovsPortOwner = "ovs-cni.network.kubevirt.io"
+const defaultOVSSocket = "unix:/var/run/openvswitch/db.sock"
 const (
 	bridgeTable = "Bridge"
 	ovsTable    = "Open_vSwitch"
@@ -92,7 +93,7 @@ func NewOvsDriver(ovsSocket string) (*OvsDriver, error) {
 	ovsDriver := new(OvsDriver)
 
 	if ovsSocket == "" {
-		ovsSocket = "unix:/var/run/openvswitch/db.sock"
+		ovsSocket = defaultOVSSocket
 	}
 
 	ovsDB, err := connectToOvsDb(ovsSocket)
@@ -110,7 +111,7 @@ func NewOvsBridgeDriver(bridgeName, socketFile string) (*OvsBridgeDriver, error)
 	ovsDriver := new(OvsBridgeDriver)
 
 	if socketFile == "" {
-		socketFile = "unix:/var/run/openvswitch/db.sock"
+		socketFile = defaultOVSSocket
 	}
 
 	ovsDB, err := connectToOvsDb(socketFile)
@@ -720,6 +721,19 @@ func (ovsd *OvsDriver) FindInterfacesWithError() ([]string, error) {
 	return names, nil
 }
 
+// InterfaceHasError checks whether a specific interface is in error state
+func (ovsd *OvsDriver) InterfaceHasError(ifaceName string) (bool, error) {
+	condition := ovsdb.NewCondition("name", ovsdb.ConditionEqual, ifaceName)
+	row, err := ovsd.findByCondition("Interface", condition, []string{"error"})
+	if err != nil {
+		if errors.Is(err, errObjectNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return hasError(row), nil
+}
+
 func hasError(row map[string]interface{}) bool {
 	v := row["error"]
 	switch x := v.(type) {
@@ -1092,14 +1106,42 @@ func detachMirrorFromBridgeOperation(mirrorUUID ovsdb.UUID, bridgeName string) *
 	return &mutateOp
 }
 
-// findEmptyMirrors returns the empty mirrors (no select_src_port, select_dst_port and output ports)
-func (ovsd *OvsDriver) findEmptyMirrors() ([]string, error) {
+// findEmptyMirrors returns the empty mirrors (no select_src_port, select_dst_port
+// and output ports) that belong to the current bridge. Only mirrors referenced
+// by this bridge are considered so that cleanup never attempts to delete mirrors
+// owned by a different bridge, which would cause OVSDB referential integrity
+// violations.
+func (ovsd *OvsBridgeDriver) findEmptyMirrors() ([]string, error) {
+	// Get the mirror UUIDs attached to this bridge.
+	bridgeCondition := ovsdb.NewCondition("name", ovsdb.ConditionEqual, ovsd.OvsBridgeName)
+	bridgeRow, err := ovsd.findByCondition("Bridge", bridgeCondition, []string{"mirrors"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get bridge mirrors: %v", err)
+	}
+
+	bridgeMirrorUUIDs, err := convertToArray(bridgeRow["mirrors"])
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert bridge mirrors to array: %v", err)
+	}
+
+	if len(bridgeMirrorUUIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build a set of this bridge's mirror UUIDs for filtering.
+	bridgeMirrorSet := make(map[string]bool, len(bridgeMirrorUUIDs))
+	for _, elem := range bridgeMirrorUUIDs {
+		if u, ok := elem.(ovsdb.UUID); ok {
+			bridgeMirrorSet[u.GoUUID] = true
+		}
+	}
+
+	// Query all mirrors and keep only those belonging to this bridge.
 	var names []string
 
-	// get all mirrors
 	selectOp := ovsdb.Operation{
 		Op:      "select",
-		Columns: []string{"name", "output_port", "select_src_port", "select_dst_port"},
+		Columns: []string{"_uuid", "name", "output_port", "select_src_port", "select_dst_port"},
 		Table:   "Mirror",
 	}
 	transactionResult, err := ovsd.ovsdbTransact([]ovsdb.Operation{selectOp})
@@ -1114,8 +1156,15 @@ func (ovsd *OvsDriver) findEmptyMirrors() ([]string, error) {
 		return nil, errors.New(operationResult.Error)
 	}
 
-	// extract mirror names with both output_port, select_src_port and select_dst_port empty
 	for _, row := range operationResult.Rows {
+		mirrorUUID, ok := row["_uuid"].(ovsdb.UUID)
+		if !ok {
+			continue
+		}
+		if !bridgeMirrorSet[mirrorUUID.GoUUID] {
+			continue
+		}
+
 		isEmpty, err := isMirrorEmpty(row)
 		if err != nil {
 			return nil, fmt.Errorf("cannot convert select_src_port to an array error: %v", err)
@@ -1133,7 +1182,7 @@ func (ovsd *OvsDriver) findEmptyMirrors() ([]string, error) {
 
 // isMirrorEmpty Checks if a mirror db row has both output_port, select_src_port and select_dst_port empty
 func isMirrorEmpty(dbRow map[string]interface{}) (bool, error) {
-	// Workaround to check output_port, select_dst_port and select_src_port consistenly, processing all
+	// Workaround to check output_port, select_dst_port and select_src_port consistently, processing all
 	// of them as array of UUIDs.
 	// This is useful because ovn-org/libovsdb:
 	// - when dbRow["column"] is empty in ovsdb, it returns an empty ovsdb.OvsSet
